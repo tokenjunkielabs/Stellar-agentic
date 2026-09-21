@@ -3,8 +3,15 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { formatQuotePreview, formatRoute, runCli, type CliIO } from '../index.js';
-import type { PaymentQuote } from '@stellaragent/core';
+import {
+  formatLimitsStatus,
+  formatQuotePreview,
+  formatRoute,
+  runCli,
+  type CliIO,
+  type LimitsClient,
+} from '../index.js';
+import type { PaymentQuote, RateLimitConfig, RateLimitStatus } from '@stellaragent/core';
 
 const pkgRoot = process.cwd();
 const entry = resolve(pkgRoot, 'src/index.ts');
@@ -50,6 +57,52 @@ function quote(): PaymentQuote {
   };
 }
 
+function rateLimitStatus(overrides: Partial<RateLimitStatus> = {}): RateLimitStatus {
+  return {
+    configured: true,
+    active: true,
+    maxPerTx: '2.0000000',
+    maxPerHour: '10.0000000',
+    maxPerDay: '100.0000000',
+    maxTxsPerHour: 20,
+    spentThisHour: '3.5000000',
+    spentToday: '25.0000000',
+    txsThisHour: 4,
+    hourWindowStartLedger: 1_000,
+    dayWindowStartLedger: 100,
+    ...overrides,
+  };
+}
+
+function limitsClient(status: RateLimitStatus = rateLimitStatus()): {
+  client: LimitsClient;
+  configured: RateLimitConfig[];
+  targets: Array<string | undefined>;
+} {
+  const configured: RateLimitConfig[] = [];
+  const targets: Array<string | undefined> = [];
+  return {
+    configured,
+    targets,
+    client: {
+      address: 'GCLIAGENT',
+      setRateLimits: async (config) => {
+        configured.push(config);
+        return { hash: 'abc123', success: true, ledger: 1_234 };
+      },
+      getRateLimitStatus: async (target) => {
+        targets.push(target);
+        return status;
+      },
+      getLedgerCloseEstimate: async () => ({
+        currentLedger: 1_360,
+        avgLedgerCloseSeconds: 5,
+        observed: true,
+      }),
+    },
+  };
+}
+
 function capture(): { io: CliIO; stdout: string[]; stderr: string[] } {
   const stdout: string[] = [];
   const stderr: string[] = [];
@@ -83,6 +136,8 @@ describe('@stellaragent/cli packaging', () => {
       env: { ...process.env, NODE_ENV: 'production' },
     });
     expect(out).toContain('route preview');
+    expect(out).toContain('limits set');
+    expect(out).toContain('limits show');
   });
 });
 
@@ -154,5 +209,106 @@ describe('route preview', () => {
 
     expect(formatRoute(value.route)).toBe('XLM → PATH[horizon via AQUA] → USDC');
     expect(formatQuotePreview(value)).toContain('broken-amm/VENUE_UNAVAILABLE');
+  });
+});
+
+describe('limits commands', () => {
+  it('sets all on-chain limits through the SDK and prints the transaction receipt', async () => {
+    const mock = limitsClient();
+    const output = capture();
+    const exitCode = await runCli([
+      'limits',
+      'set',
+      '--max-per-tx',
+      '2',
+      '--max-per-hour',
+      '10',
+      '--max-per-day',
+      '100',
+      '--max-txs-per-hour',
+      '20',
+    ], output.io, { createLimitsClient: async () => mock.client });
+
+    expect(exitCode).toBe(0);
+    expect(mock.configured).toEqual([{
+      maxPerTx: '2',
+      maxPerHour: '10',
+      maxPerDay: '100',
+      maxTxsPerHour: 20,
+    }]);
+    expect(output.stdout.join('\n')).toContain('Transaction:           abc123');
+    expect(output.stdout.join('\n')).toContain('Confirmed ledger:      1234');
+  });
+
+  it('shows remaining amount and transaction headroom with ledger-time resets', async () => {
+    const mock = limitsClient();
+    const output = capture();
+    const exitCode = await runCli(
+      ['limits', 'show', '--agent', 'GTARGET'],
+      output.io,
+      { createLimitsClient: async () => mock.client },
+    );
+    const contents = output.stdout.join('\n');
+
+    expect(exitCode).toBe(0);
+    expect(mock.targets).toEqual(['GTARGET']);
+    expect(contents).toContain('6.5000000 remaining of 10.0000000');
+    expect(contents).toContain('16 remaining of 20');
+    expect(contents).toContain('75.0000000 remaining of 100.0000000');
+    expect(contents).toContain('ledger 1720 in ~30m');
+    expect(contents).toContain('(observed 5.00s/ledger)');
+  });
+
+  it('treats expired windows as reset headroom instead of stale spend', () => {
+    const contents = formatLimitsStatus(
+      'GEXPIRED',
+      rateLimitStatus({
+        spentThisHour: '9.0000000',
+        txsThisHour: 19,
+        hourWindowStartLedger: 100,
+      }),
+      { currentLedger: 1_000, avgLedgerCloseSeconds: 5, observed: true },
+    );
+
+    expect(contents).toContain('10.0000000 remaining of 10.0000000 (0 spent)');
+    expect(contents).toContain('20 remaining of 20 (0 used)');
+    expect(contents).toContain('window expired at ledger 820');
+  });
+
+  it('states plainly when the agent has no configured limits', async () => {
+    const mock = limitsClient(rateLimitStatus({ configured: false }));
+    const output = capture();
+    const exitCode = await runCli(
+      ['limits', 'show'],
+      output.io,
+      { createLimitsClient: async () => mock.client },
+    );
+
+    expect(exitCode).toBe(0);
+    expect(output.stdout.join('\n')).toBe(
+      'No rate limits configured for GCLIAGENT. ' +
+      'Payments are unrestricted by the rate limiter.',
+    );
+  });
+
+  it('rejects missing and sub-stroop limit options before an SDK mutation', async () => {
+    const mock = limitsClient();
+    const output = capture();
+    const exitCode = await runCli([
+      'limits',
+      'set',
+      '--max-per-tx',
+      '0.00000001',
+      '--max-per-hour',
+      '10',
+      '--max-per-day',
+      '100',
+      '--max-txs-per-hour',
+      '20',
+    ], output.io, { createLimitsClient: async () => mock.client });
+
+    expect(exitCode).toBe(2);
+    expect(mock.configured).toEqual([]);
+    expect(output.stderr.join('\n')).toContain('at most 7 fractional digits');
   });
 });
